@@ -245,7 +245,9 @@ def evaluate_one_dataset(
 def worker_main(
     worker_id: int,
     gpu_id: int,
-    task_queue,
+    assigned_csv_paths: List[str],
+    ready_queue,
+    start_event,
     worker_out_csv: str,
     regressor_kwargs: Dict,
     predict_kwargs: Dict,
@@ -256,55 +258,41 @@ def worker_main(
 ) -> None:
     try:
         gpu_id_str = str(gpu_id)
-        os.environ["HIP_VISIBLE_DEVICES"] = gpu_id_str
         os.environ["ROCR_VISIBLE_DEVICES"] = gpu_id_str
-        os.environ["CUDA_VISIBLE_DEVICES"] = gpu_id_str
+        os.environ.pop("HIP_VISIBLE_DEVICES", None)
+        os.environ.pop("CUDA_VISIBLE_DEVICES", None)
         os.environ.setdefault("OMP_NUM_THREADS", "1")
         os.environ.setdefault("MKL_NUM_THREADS", "1")
 
         import torch
 
-        requested_device = str(regressor_kwargs.get("device") or "cuda:0")
-        if requested_device.startswith("cuda") and not torch.cuda.is_available():
+        if not torch.cuda.is_available():
             torch_diag = collect_torch_diagnostics()
             raise RuntimeError(
                 "GPU backend is not available in this worker. "
                 f"Diagnostics: {json.dumps(torch_diag, ensure_ascii=False)}"
             )
-        if requested_device.startswith("cuda"):
-            # Each worker sees exactly one GPU after HIP/ROCR_VISIBLE_DEVICES masking.
-            regressor_kwargs["device"] = "cuda:0"
-            torch.cuda.set_device(0)
-
-        if verbose:
-            print(
-                f"[worker {worker_id} | gpu {gpu_id}] starting pid={os.getpid()} "
-                f"requested_device={requested_device} worker_device={regressor_kwargs.get('device')} "
-                f"diag={json.dumps(collect_torch_diagnostics(), ensure_ascii=False)}",
-                flush=True,
-            )
 
         from tabdpt import TabDPTRegressor
 
-        regressor = TabDPTRegressor(**regressor_kwargs)
+        worker_kwargs = dict(regressor_kwargs)
+        if str(worker_kwargs.get("device") or "cuda:0").startswith("cuda"):
+            worker_kwargs["device"] = "cuda:0"
 
-        if verbose:
-            print(
-                f"[worker {worker_id} | gpu {gpu_id}] model initialized "
-                f"inf_batch_size={regressor.inf_batch_size} use_flash={regressor.use_flash} "
-                f"compile={regressor.compile}",
-                flush=True,
-            )
+        regressor = TabDPTRegressor(**worker_kwargs)
+        ready_queue.put(
+            {
+                "worker_id": worker_id,
+                "gpu_id": gpu_id,
+                "status": "ready",
+                "assigned_count": len(assigned_csv_paths),
+            }
+        )
+        start_event.wait()
 
         rows: List[ResultRow] = []
-        while True:
-            item = task_queue.get()
-            if item is None:
-                break
-
+        for item in assigned_csv_paths:
             csv_path = Path(item)
-            if verbose:
-                print(f"[worker {worker_id} | gpu {gpu_id}] start {csv_path.name}", flush=True)
             row = evaluate_one_dataset(
                 regressor,
                 csv_path,
@@ -319,21 +307,31 @@ def worker_main(
                 if row.status == "ok":
                     print(
                         f"[worker {worker_id} | gpu {gpu_id}] "
-                        f"[ok] {row.dataset_name} r2={row.r2:.6f} rmse={row.rmse:.6f}",
-                        flush=True,
+                        f"[ok] {row.dataset_name} r2={row.r2:.6f} rmse={row.rmse:.6f}"
                     )
                 else:
                     print(
                         f"[worker {worker_id} | gpu {gpu_id}] "
-                        f"[fail] {row.dataset_name} error={row.error}",
-                        flush=True,
+                        f"[fail] {row.dataset_name} error={row.error}"
                     )
 
+        Path(worker_out_csv).parent.mkdir(parents=True, exist_ok=True)
         pd.DataFrame(
             [asdict(row) for row in rows],
             columns=list(ResultRow.__annotations__.keys()),
         ).to_csv(worker_out_csv, index=False)
     except Exception:
+        try:
+            ready_queue.put(
+                {
+                    "worker_id": worker_id,
+                    "gpu_id": gpu_id,
+                    "status": "crash",
+                    "error": traceback.format_exc(),
+                }
+            )
+        except Exception:
+            pass
         crash_row = pd.DataFrame(
             [
                 {
@@ -353,6 +351,7 @@ def worker_main(
                 }
             ]
         )
+        Path(worker_out_csv).parent.mkdir(parents=True, exist_ok=True)
         crash_row.to_csv(worker_out_csv, index=False)
 
 
@@ -483,15 +482,13 @@ def main() -> None:
         pass
 
     start_time = time.time()
-    task_queue: mp.Queue = mp.Queue()
-    for csv_path in csv_files:
-        task_queue.put(str(csv_path))
-    for _ in range(args.workers):
-        task_queue.put(None)
+    ready_queue: mp.Queue = mp.Queue()
+    start_event = mp.Event()
 
     worker_csv_paths: List[Path] = []
     processes: List[mp.Process] = []
     for worker_id in range(args.workers):
+        assigned_csv_paths = [str(path) for path in csv_files[worker_id::args.workers]]
         worker_csv = out_dir / f"worker_{worker_id}.csv"
         worker_csv_paths.append(worker_csv)
         proc = mp.Process(
@@ -499,7 +496,9 @@ def main() -> None:
             args=(
                 worker_id,
                 gpu_ids[worker_id],
-                task_queue,
+                assigned_csv_paths,
+                ready_queue,
+                start_event,
                 str(worker_csv),
                 dict(regressor_kwargs),
                 dict(predict_kwargs),
@@ -512,6 +511,40 @@ def main() -> None:
         )
         proc.start()
         processes.append(proc)
+
+    ready_workers: set[int] = set()
+    while len(ready_workers) < args.workers:
+        try:
+            message = ready_queue.get(timeout=10)
+        except Exception:
+            dead_workers = [
+                str(idx)
+                for idx, proc in enumerate(processes)
+                if not proc.is_alive() and idx not in ready_workers
+            ]
+            if dead_workers:
+                raise RuntimeError(
+                    "Some workers exited before initialization completed: "
+                    + ", ".join(dead_workers)
+                )
+            continue
+
+        if message.get("status") == "ready":
+            ready_workers.add(int(message["worker_id"]))
+            if args.verbose:
+                print(
+                    f"[worker {message['worker_id']} | gpu {message['gpu_id']}] "
+                    f"ready assigned={message.get('assigned_count', '?')}"
+                )
+            continue
+
+        if message.get("status") == "crash":
+            raise RuntimeError(
+                f"Worker {message['worker_id']} on gpu {message['gpu_id']} crashed "
+                f"during initialization:\n{message.get('error', '(no traceback)')}"
+            )
+
+    start_event.set()
 
     for proc in processes:
         proc.join()
