@@ -79,8 +79,9 @@ class TabDPTEstimator(BaseEstimator):
         """
         self.mode = mode
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        self.inf_batch_size = inf_batch_size if self.device == "cuda" else min(inf_batch_size, CPU_INF_BATCH)
-        self.use_flash = use_flash and self.device == "cuda"
+        self.is_cuda_device = str(self.device).startswith("cuda")
+        self.inf_batch_size = inf_batch_size if self.is_cuda_device else min(inf_batch_size, CPU_INF_BATCH)
+        self.use_flash = use_flash and self.is_cuda_device
         self.missing_indicators = missing_indicators
 
         if model_weight_path:
@@ -88,19 +89,24 @@ class TabDPTEstimator(BaseEstimator):
         else:
             self.path = self.download_weights()
 
-        with safe_open(self.path, framework="pt", device=self.device) as f:
+        # Load checkpoint tensors on CPU first so worker initialization does not
+        # reserve an identical extra GPU cache on every device.
+        with safe_open(self.path, framework="pt", device="cpu") as f:
             meta = f.metadata()
             cfg_dict = json.loads(meta["cfg"])
             cfg = OmegaConf.create(cfg_dict)
             model_state = {k: f.get_tensor(k) for k in f.keys()}
 
-        cfg.env.device = self.device
+        cfg.env.device = "cpu"
         self.model = TabDPTModel.load(model_state=model_state, config=cfg, use_flash=self.use_flash, clip_sigma=clip_sigma)
+        if self.is_cuda_device:
+            self.model.to(self.device)
         self.model.eval()
+        del model_state
 
         self.max_features = self.model.num_features
         self.max_num_classes = self.model.n_out
-        self.compile = compile and self.device == "cuda"
+        self.compile = compile and self.is_cuda_device
         self.feature_reduction = feature_reduction
         self.faiss_metric = faiss_metric
         self.faiss_knn = None

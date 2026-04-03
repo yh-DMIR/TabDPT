@@ -7,18 +7,17 @@ import argparse
 import json
 import multiprocessing as mp
 import os
+import sys
 import time
 import traceback
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Dict, List, Optional
 
-import numpy as np
-import pandas as pd
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import OrdinalEncoder, StandardScaler
-
+REPO_ROOT = Path(__file__).resolve().parent
+SRC_DIR = REPO_ROOT / "src"
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
 
 DATA_DIRS = [
     Path("dataset/ctr23"),
@@ -27,6 +26,15 @@ DATA_DIRS = [
 ]
 
 TARGET_CANDIDATES = ["target", "label", "y", "TARGET", "Label", "Y"]
+
+np = None
+pd = None
+mean_absolute_error = None
+mean_squared_error = None
+r2_score = None
+train_test_split = None
+OrdinalEncoder = None
+StandardScaler = None
 
 
 @dataclass
@@ -44,6 +52,41 @@ class ResultRow:
     predict_seconds: float
     status: str
     error: Optional[str]
+
+
+def ensure_runtime_deps() -> None:
+    global np
+    global pd
+    global mean_absolute_error
+    global mean_squared_error
+    global r2_score
+    global train_test_split
+    global OrdinalEncoder
+    global StandardScaler
+
+    if np is None or pd is None:
+        import numpy as _np
+        import pandas as _pd
+        from sklearn.metrics import (
+            mean_absolute_error as _mean_absolute_error,
+            mean_squared_error as _mean_squared_error,
+            r2_score as _r2_score,
+        )
+        from sklearn.model_selection import train_test_split as _train_test_split
+        from sklearn.preprocessing import (
+            OrdinalEncoder as _OrdinalEncoder,
+            StandardScaler as _StandardScaler,
+        )
+
+        np = _np
+        pd = _pd
+        mean_absolute_error = _mean_absolute_error
+        mean_squared_error = _mean_squared_error
+        r2_score = _r2_score
+        train_test_split = _train_test_split
+        OrdinalEncoder = _OrdinalEncoder
+        StandardScaler = _StandardScaler
+
 
 def infer_target_column(df: pd.DataFrame) -> str:
     for col in TARGET_CANDIDATES:
@@ -72,26 +115,6 @@ def find_csv_files(data_dirs: List[Path]) -> List[Path]:
     return csv_files
 
 
-def collect_torch_diagnostics() -> Dict[str, object]:
-    import torch
-
-    try:
-        device_count = torch.cuda.device_count()
-    except Exception as exc:
-        device_count = f"error: {exc}"
-
-    return {
-        "torch_version": torch.__version__,
-        "torch_cuda_version": getattr(torch.version, "cuda", None),
-        "torch_hip_version": getattr(torch.version, "hip", None),
-        "cuda_available": torch.cuda.is_available(),
-        "cuda_device_count": device_count,
-        "HIP_VISIBLE_DEVICES": os.environ.get("HIP_VISIBLE_DEVICES"),
-        "ROCR_VISIBLE_DEVICES": os.environ.get("ROCR_VISIBLE_DEVICES"),
-        "CUDA_VISIBLE_DEVICES": os.environ.get("CUDA_VISIBLE_DEVICES"),
-    }
-
-
 def resolve_model_weight_path(model_path_arg: Optional[str]) -> str:
     if model_path_arg:
         model_path = Path(model_path_arg).expanduser()
@@ -117,10 +140,31 @@ def resolve_model_weight_path(model_path_arg: Optional[str]) -> str:
     return str(downloaded)
 
 
+def collect_torch_diagnostics() -> Dict[str, object]:
+    import torch
+
+    try:
+        device_count = torch.cuda.device_count()
+    except Exception as exc:
+        device_count = f"error: {exc}"
+
+    return {
+        "torch_version": torch.__version__,
+        "torch_cuda_version": getattr(torch.version, "cuda", None),
+        "torch_hip_version": getattr(torch.version, "hip", None),
+        "cuda_available": torch.cuda.is_available(),
+        "cuda_device_count": device_count,
+        "HIP_VISIBLE_DEVICES": os.environ.get("HIP_VISIBLE_DEVICES"),
+        "ROCR_VISIBLE_DEVICES": os.environ.get("ROCR_VISIBLE_DEVICES"),
+        "CUDA_VISIBLE_DEVICES": os.environ.get("CUDA_VISIBLE_DEVICES"),
+    }
+
+
 def encode_features(
     X_train_df: pd.DataFrame,
     X_test_df: pd.DataFrame,
 ) -> tuple[np.ndarray, np.ndarray]:
+    ensure_runtime_deps()
     X_train_df = X_train_df.copy()
     X_test_df = X_test_df.copy()
 
@@ -156,11 +200,13 @@ def encode_features(
 def evaluate_one_dataset(
     regressor,
     csv_path: Path,
+    *,
     predict_kwargs: Dict,
     test_size: float,
     random_state: int,
     target_standardize: bool,
 ) -> ResultRow:
+    ensure_runtime_deps()
     try:
         df = pd.read_csv(csv_path)
         target_col = infer_target_column(df)
@@ -173,7 +219,9 @@ def evaluate_one_dataset(
         y = y.loc[valid_mask].reset_index(drop=True)
 
         if len(X_df) < 2:
-            raise ValueError("Not enough valid rows after converting target column to numeric.")
+            raise ValueError(
+                "Not enough valid rows after converting target column to numeric."
+            )
 
         X_train_df, X_test_df, y_train, y_test = train_test_split(
             X_df,
@@ -190,7 +238,9 @@ def evaluate_one_dataset(
         y_train_for_model = y_train
         if target_standardize:
             target_scaler = StandardScaler()
-            y_train_for_model = target_scaler.fit_transform(y_train.reshape(-1, 1)).ravel().astype(np.float32)
+            y_train_for_model = target_scaler.fit_transform(
+                y_train.reshape(-1, 1)
+            ).ravel().astype(np.float32)
 
         t0 = time.time()
         regressor.fit(X_train, y_train_for_model)
@@ -244,7 +294,7 @@ def evaluate_one_dataset(
 def worker_main(
     worker_id: int,
     gpu_id: int,
-    assigned_csv_files: List[str],
+    assigned_csv_paths: List[str],
     ready_queue,
     start_event,
     worker_out_csv: str,
@@ -256,6 +306,7 @@ def worker_main(
     verbose: bool,
 ) -> None:
     try:
+        ensure_runtime_deps()
         gpu_id_str = str(gpu_id)
         os.environ["ROCR_VISIBLE_DEVICES"] = gpu_id_str
         os.environ.pop("HIP_VISIBLE_DEVICES", None)
@@ -264,33 +315,37 @@ def worker_main(
         os.environ.setdefault("MKL_NUM_THREADS", "1")
 
         import torch
+        from tabdpt import TabDPTRegressor
 
+        torch_diag = collect_torch_diagnostics()
         if not torch.cuda.is_available():
-            torch_diag = collect_torch_diagnostics()
             raise RuntimeError(
                 "GPU backend is not available in this worker. "
                 f"Diagnostics: {json.dumps(torch_diag, ensure_ascii=False)}"
             )
 
-        from tabdpt import TabDPTRegressor
-
-        worker_regressor_kwargs = dict(regressor_kwargs)
-        worker_regressor_kwargs["device"] = "cuda:0"
-        regressor = TabDPTRegressor(**worker_regressor_kwargs)
-
+        worker_kwargs = dict(regressor_kwargs)
+        worker_kwargs["device"] = "cuda:0"
+        regressor = TabDPTRegressor(**worker_kwargs)
         ready_queue.put(
             {
                 "worker_id": worker_id,
                 "gpu_id": gpu_id,
                 "status": "ready",
-                "assigned_count": len(assigned_csv_files),
+                "assigned_count": len(assigned_csv_paths),
             }
         )
         start_event.wait()
 
         rows: List[ResultRow] = []
-        for item in assigned_csv_files:
+        for item in assigned_csv_paths:
             csv_path = Path(item)
+            if verbose:
+                print(
+                    f"[worker {worker_id} | gpu {gpu_id}] [start] {csv_path.name}",
+                    flush=True,
+                )
+
             row = evaluate_one_dataset(
                 regressor,
                 csv_path,
@@ -305,12 +360,14 @@ def worker_main(
                 if row.status == "ok":
                     print(
                         f"[worker {worker_id} | gpu {gpu_id}] "
-                        f"[ok] {row.dataset_name} r2={row.r2:.6f} rmse={row.rmse:.6f}"
+                        f"[ok] {row.dataset_name} r2={row.r2:.6f} rmse={row.rmse:.6f}",
+                        flush=True,
                     )
                 else:
                     print(
                         f"[worker {worker_id} | gpu {gpu_id}] "
-                        f"[fail] {row.dataset_name} error={row.error}"
+                        f"[fail] {row.dataset_name} error={row.error}",
+                        flush=True,
                     )
 
         pd.DataFrame(
@@ -329,6 +386,8 @@ def worker_main(
             )
         except Exception:
             pass
+
+        ensure_runtime_deps()
         crash_row = pd.DataFrame(
             [
                 {
@@ -351,7 +410,13 @@ def worker_main(
         crash_row.to_csv(worker_out_csv, index=False)
 
 
-def write_summary(summary_path: Path, result_df: pd.DataFrame, csv_files: List[Path], wall_seconds: float) -> None:
+def write_summary(
+    summary_path: Path,
+    result_df: pd.DataFrame,
+    csv_files: List[Path],
+    wall_seconds: float,
+) -> None:
+    ensure_runtime_deps()
     ok_df = result_df[result_df["status"] == "ok"].copy() if len(result_df) else pd.DataFrame()
     failed_df = result_df[result_df["status"] == "fail"].copy() if len(result_df) else pd.DataFrame()
 
@@ -375,7 +440,13 @@ def write_summary(summary_path: Path, result_df: pd.DataFrame, csv_files: List[P
     summary_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def write_group_outputs(out_dir: Path, all_df: pd.DataFrame, csv_files: List[Path], wall_seconds: float) -> None:
+def write_group_outputs(
+    out_dir: Path,
+    all_df: pd.DataFrame,
+    csv_files: List[Path],
+    wall_seconds: float,
+) -> None:
+    ensure_runtime_deps()
     grouped_csv_files: Dict[str, List[Path]] = {}
     for csv_path in csv_files:
         grouped_csv_files.setdefault(dataset_group_name(csv_path), []).append(csv_path)
@@ -397,14 +468,17 @@ def write_group_outputs(out_dir: Path, all_df: pd.DataFrame, csv_files: List[Pat
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Run TabDPT official regressor on regression dataset folders with AMD/ROCm multi-GPU."
+        description=(
+            "Run TabDPT official regressor on regression dataset folders with "
+            "AMD/ROCm multi-GPU."
+        )
     )
     parser.add_argument(
         "--model-path",
         default=None,
         help=(
-            "Local TabDPT weight path. If omitted, use ./tabdpt1_1.safetensors when present; "
-            "otherwise download the official weight once in the main process."
+            "Local TabDPT weight path. If omitted, use ./tabdpt1_1.safetensors when "
+            "present; otherwise download the official weight once in the main process."
         ),
     )
     parser.add_argument("--out-dir", default="result/TabDPT_official_regression")
@@ -432,14 +506,17 @@ def main() -> None:
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
 
+    ensure_runtime_deps()
+    model_path = resolve_model_weight_path(args.model_path)
+
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     csv_files = find_csv_files(DATA_DIRS)
     if not csv_files:
-        raise FileNotFoundError("No CSV files found under dataset/ctr23, dataset/tabarena/reg, dataset/talent_reg")
-
-    model_path = resolve_model_weight_path(args.model_path)
+        raise FileNotFoundError(
+            "No CSV files found under dataset/ctr23, dataset/tabarena/reg, dataset/talent_reg"
+        )
 
     gpu_ids = [int(x.strip()) for x in args.gpus.split(",") if x.strip()]
     if len(gpu_ids) != args.workers:
@@ -449,7 +526,7 @@ def main() -> None:
     if isinstance(normalizer, str) and normalizer.lower() == "none":
         normalizer = None
 
-    regressor_kwargs: Dict = {
+    regressor_kwargs: Dict[str, object] = {
         "inf_batch_size": args.inf_batch_size,
         "normalizer": normalizer,
         "missing_indicators": bool(args.missing_indicators),
@@ -462,7 +539,7 @@ def main() -> None:
         "model_weight_path": model_path,
         "verbose": False,
     }
-    predict_kwargs: Dict = {
+    predict_kwargs: Dict[str, object] = {
         "n_ensembles": int(args.n_ensembles),
         "context_size": int(args.context_size),
         "seed": int(args.seed) if args.seed is not None else None,
@@ -484,6 +561,7 @@ def main() -> None:
     worker_csv_paths: List[Path] = []
     processes: List[mp.Process] = []
     for worker_id in range(args.workers):
+        assigned_csv_paths = [str(path) for path in csv_files[worker_id::args.workers]]
         worker_csv = out_dir / f"worker_{worker_id}.csv"
         worker_csv_paths.append(worker_csv)
         proc = mp.Process(
@@ -491,7 +569,7 @@ def main() -> None:
             args=(
                 worker_id,
                 gpu_ids[worker_id],
-                [str(path) for path in csv_files[worker_id::args.workers]],
+                assigned_csv_paths,
                 ready_queue,
                 start_event,
                 str(worker_csv),
@@ -528,7 +606,8 @@ def main() -> None:
             ready_workers.add(int(message["worker_id"]))
             print(
                 f"[worker {message['worker_id']} | gpu {message['gpu_id']}] "
-                f"ready assigned={message.get('assigned_count', '?')}"
+                f"ready assigned={message.get('assigned_count', '?')}",
+                flush=True,
             )
             continue
 
@@ -548,7 +627,11 @@ def main() -> None:
         if worker_csv.exists():
             dfs.append(pd.read_csv(worker_csv))
 
-    all_df = pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame(columns=ResultRow.__annotations__.keys())
+    all_df = (
+        pd.concat(dfs, ignore_index=True)
+        if dfs
+        else pd.DataFrame(columns=ResultRow.__annotations__.keys())
+    )
     all_csv = out_dir / "all_regression_results.csv"
     summary_txt = out_dir / "summary.txt"
     all_df.to_csv(all_csv, index=False)
