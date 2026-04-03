@@ -4,3 +4,5 @@ tabdpt.egg-info/
 uv.lock
 .venv/
 eval_output/
+dataset/
+limix/

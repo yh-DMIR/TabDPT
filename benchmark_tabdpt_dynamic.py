@@ -64,7 +64,6 @@ TARGET_CANDIDATES = [
     "TARGET", "Label", "Class", "Y",
 ]
 
-
 def sanitize_dataset_id(train_path: Path) -> str:
     m = re.search(r"(OpenML-ID-\d+)", str(train_path))
     return m.group(1) if m else train_path.parent.name
