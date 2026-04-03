@@ -7,7 +7,6 @@ import argparse
 import json
 import multiprocessing as mp
 import os
-import queue
 import time
 import traceback
 from dataclasses import asdict, dataclass
@@ -91,25 +90,6 @@ def collect_torch_diagnostics() -> Dict[str, object]:
         "ROCR_VISIBLE_DEVICES": os.environ.get("ROCR_VISIBLE_DEVICES"),
         "CUDA_VISIBLE_DEVICES": os.environ.get("CUDA_VISIBLE_DEVICES"),
     }
-
-
-def normalize_worker_device(requested_device: str | None) -> str:
-    if requested_device is None:
-        return "cuda:0"
-
-    requested_device = str(requested_device).strip()
-    if requested_device.startswith("cuda"):
-        # Each worker masks visibility to a single GPU, so the correct local
-        # device is always cuda:0 regardless of the physical GPU id.
-        return "cuda:0"
-    return requested_device
-
-
-def partition_csv_files(csv_files: List[Path], num_workers: int) -> List[List[Path]]:
-    partitions: List[List[Path]] = [[] for _ in range(num_workers)]
-    for index, csv_path in enumerate(csv_files):
-        partitions[index % num_workers].append(csv_path)
-    return partitions
 
 
 def resolve_model_weight_path(model_path_arg: Optional[str]) -> str:
@@ -265,8 +245,8 @@ def worker_main(
     worker_id: int,
     gpu_id: int,
     assigned_csv_files: List[str],
-    start_event,
     ready_queue,
+    start_event,
     worker_out_csv: str,
     regressor_kwargs: Dict,
     predict_kwargs: Dict,
@@ -277,36 +257,33 @@ def worker_main(
 ) -> None:
     try:
         gpu_id_str = str(gpu_id)
-        os.environ["HIP_VISIBLE_DEVICES"] = gpu_id_str
         os.environ["ROCR_VISIBLE_DEVICES"] = gpu_id_str
-        os.environ["CUDA_VISIBLE_DEVICES"] = gpu_id_str
+        os.environ.pop("HIP_VISIBLE_DEVICES", None)
+        os.environ.pop("CUDA_VISIBLE_DEVICES", None)
         os.environ.setdefault("OMP_NUM_THREADS", "1")
         os.environ.setdefault("MKL_NUM_THREADS", "1")
 
         import torch
 
-        requested_device = normalize_worker_device(regressor_kwargs.get("device"))
-        if requested_device.startswith("cuda") and not torch.cuda.is_available():
+        if not torch.cuda.is_available():
             torch_diag = collect_torch_diagnostics()
             raise RuntimeError(
                 "GPU backend is not available in this worker. "
                 f"Diagnostics: {json.dumps(torch_diag, ensure_ascii=False)}"
             )
-        if requested_device.startswith("cuda"):
-            torch.cuda.set_device(requested_device)
 
         from tabdpt import TabDPTRegressor
 
         worker_regressor_kwargs = dict(regressor_kwargs)
-        worker_regressor_kwargs["device"] = requested_device
+        worker_regressor_kwargs["device"] = "cuda:0"
         regressor = TabDPTRegressor(**worker_regressor_kwargs)
 
         ready_queue.put(
             {
                 "worker_id": worker_id,
                 "gpu_id": gpu_id,
-                "device": requested_device,
-                "diag": collect_torch_diagnostics(),
+                "status": "ready",
+                "assigned_count": len(assigned_csv_files),
             }
         )
         start_event.wait()
@@ -341,6 +318,17 @@ def worker_main(
             columns=list(ResultRow.__annotations__.keys()),
         ).to_csv(worker_out_csv, index=False)
     except Exception:
+        try:
+            ready_queue.put(
+                {
+                    "worker_id": worker_id,
+                    "gpu_id": gpu_id,
+                    "status": "crash",
+                    "error": traceback.format_exc(),
+                }
+            )
+        except Exception:
+            pass
         crash_row = pd.DataFrame(
             [
                 {
@@ -490,9 +478,8 @@ def main() -> None:
         pass
 
     start_time = time.time()
-    task_partitions = partition_csv_files(csv_files, args.workers)
-    start_event = mp.Event()
     ready_queue: mp.Queue = mp.Queue()
+    start_event = mp.Event()
 
     worker_csv_paths: List[Path] = []
     processes: List[mp.Process] = []
@@ -504,9 +491,9 @@ def main() -> None:
             args=(
                 worker_id,
                 gpu_ids[worker_id],
-                [str(path) for path in task_partitions[worker_id]],
-                start_event,
+                [str(path) for path in csv_files[worker_id::args.workers]],
                 ready_queue,
+                start_event,
                 str(worker_csv),
                 dict(regressor_kwargs),
                 dict(predict_kwargs),
@@ -520,23 +507,36 @@ def main() -> None:
         proc.start()
         processes.append(proc)
 
-    ready_workers = []
+    ready_workers: set[int] = set()
     while len(ready_workers) < args.workers:
         try:
-            ready_info = ready_queue.get(timeout=30)
-        except queue.Empty:
-            dead_processes = [proc.pid for proc in processes if proc.exitcode not in (None, 0)]
-            if dead_processes:
-                raise RuntimeError(f"Some workers crashed before ready barrier: pids={dead_processes}")
-            raise RuntimeError("Timed out while waiting for all workers to finish GPU/model initialization.")
-        ready_workers.append(ready_info)
-        diag = ready_info["diag"]
-        print(
-            f"[worker {ready_info['worker_id']} | gpu {ready_info['gpu_id']}] "
-            f"ready device={ready_info['device']} "
-            f"cuda_available={diag['cuda_available']} "
-            f"visible={diag.get('HIP_VISIBLE_DEVICES')}"
-        )
+            message = ready_queue.get(timeout=10)
+        except Exception:
+            dead_workers = [
+                str(idx)
+                for idx, proc in enumerate(processes)
+                if not proc.is_alive() and idx not in ready_workers
+            ]
+            if dead_workers:
+                raise RuntimeError(
+                    "Some workers exited before initialization completed: "
+                    + ", ".join(dead_workers)
+                )
+            continue
+
+        if message.get("status") == "ready":
+            ready_workers.add(int(message["worker_id"]))
+            print(
+                f"[worker {message['worker_id']} | gpu {message['gpu_id']}] "
+                f"ready assigned={message.get('assigned_count', '?')}"
+            )
+            continue
+
+        if message.get("status") == "crash":
+            raise RuntimeError(
+                f"Worker {message['worker_id']} on gpu {message['gpu_id']} crashed "
+                f"during initialization:\n{message.get('error', '(no traceback)')}"
+            )
 
     start_event.set()
 
