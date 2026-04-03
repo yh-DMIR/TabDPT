@@ -7,6 +7,7 @@ import argparse
 import json
 import multiprocessing as mp
 import os
+import queue
 import time
 import traceback
 from dataclasses import asdict, dataclass
@@ -90,6 +91,25 @@ def collect_torch_diagnostics() -> Dict[str, object]:
         "ROCR_VISIBLE_DEVICES": os.environ.get("ROCR_VISIBLE_DEVICES"),
         "CUDA_VISIBLE_DEVICES": os.environ.get("CUDA_VISIBLE_DEVICES"),
     }
+
+
+def normalize_worker_device(requested_device: str | None) -> str:
+    if requested_device is None:
+        return "cuda:0"
+
+    requested_device = str(requested_device).strip()
+    if requested_device.startswith("cuda"):
+        # Each worker masks visibility to a single GPU, so the correct local
+        # device is always cuda:0 regardless of the physical GPU id.
+        return "cuda:0"
+    return requested_device
+
+
+def partition_csv_files(csv_files: List[Path], num_workers: int) -> List[List[Path]]:
+    partitions: List[List[Path]] = [[] for _ in range(num_workers)]
+    for index, csv_path in enumerate(csv_files):
+        partitions[index % num_workers].append(csv_path)
+    return partitions
 
 
 def resolve_model_weight_path(model_path_arg: Optional[str]) -> str:
@@ -244,7 +264,9 @@ def evaluate_one_dataset(
 def worker_main(
     worker_id: int,
     gpu_id: int,
-    task_queue,
+    assigned_csv_files: List[str],
+    start_event,
+    ready_queue,
     worker_out_csv: str,
     regressor_kwargs: Dict,
     predict_kwargs: Dict,
@@ -263,24 +285,34 @@ def worker_main(
 
         import torch
 
-        requested_device = str(regressor_kwargs.get("device") or "cuda:0")
+        requested_device = normalize_worker_device(regressor_kwargs.get("device"))
         if requested_device.startswith("cuda") and not torch.cuda.is_available():
             torch_diag = collect_torch_diagnostics()
             raise RuntimeError(
                 "GPU backend is not available in this worker. "
                 f"Diagnostics: {json.dumps(torch_diag, ensure_ascii=False)}"
             )
+        if requested_device.startswith("cuda"):
+            torch.cuda.set_device(requested_device)
 
         from tabdpt import TabDPTRegressor
 
-        regressor = TabDPTRegressor(**regressor_kwargs)
+        worker_regressor_kwargs = dict(regressor_kwargs)
+        worker_regressor_kwargs["device"] = requested_device
+        regressor = TabDPTRegressor(**worker_regressor_kwargs)
+
+        ready_queue.put(
+            {
+                "worker_id": worker_id,
+                "gpu_id": gpu_id,
+                "device": requested_device,
+                "diag": collect_torch_diagnostics(),
+            }
+        )
+        start_event.wait()
 
         rows: List[ResultRow] = []
-        while True:
-            item = task_queue.get()
-            if item is None:
-                break
-
+        for item in assigned_csv_files:
             csv_path = Path(item)
             row = evaluate_one_dataset(
                 regressor,
@@ -458,11 +490,9 @@ def main() -> None:
         pass
 
     start_time = time.time()
-    task_queue: mp.Queue = mp.Queue()
-    for csv_path in csv_files:
-        task_queue.put(str(csv_path))
-    for _ in range(args.workers):
-        task_queue.put(None)
+    task_partitions = partition_csv_files(csv_files, args.workers)
+    start_event = mp.Event()
+    ready_queue: mp.Queue = mp.Queue()
 
     worker_csv_paths: List[Path] = []
     processes: List[mp.Process] = []
@@ -474,7 +504,9 @@ def main() -> None:
             args=(
                 worker_id,
                 gpu_ids[worker_id],
-                task_queue,
+                [str(path) for path in task_partitions[worker_id]],
+                start_event,
+                ready_queue,
                 str(worker_csv),
                 dict(regressor_kwargs),
                 dict(predict_kwargs),
@@ -487,6 +519,26 @@ def main() -> None:
         )
         proc.start()
         processes.append(proc)
+
+    ready_workers = []
+    while len(ready_workers) < args.workers:
+        try:
+            ready_info = ready_queue.get(timeout=30)
+        except queue.Empty:
+            dead_processes = [proc.pid for proc in processes if proc.exitcode not in (None, 0)]
+            if dead_processes:
+                raise RuntimeError(f"Some workers crashed before ready barrier: pids={dead_processes}")
+            raise RuntimeError("Timed out while waiting for all workers to finish GPU/model initialization.")
+        ready_workers.append(ready_info)
+        diag = ready_info["diag"]
+        print(
+            f"[worker {ready_info['worker_id']} | gpu {ready_info['gpu_id']}] "
+            f"ready device={ready_info['device']} "
+            f"cuda_available={diag['cuda_available']} "
+            f"visible={diag.get('HIP_VISIBLE_DEVICES')}"
+        )
+
+    start_event.set()
 
     for proc in processes:
         proc.join()
