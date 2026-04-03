@@ -271,10 +271,30 @@ def worker_main(
                 "GPU backend is not available in this worker. "
                 f"Diagnostics: {json.dumps(torch_diag, ensure_ascii=False)}"
             )
+        if requested_device.startswith("cuda"):
+            # Each worker sees exactly one GPU after HIP/ROCR_VISIBLE_DEVICES masking.
+            regressor_kwargs["device"] = "cuda:0"
+            torch.cuda.set_device(0)
+
+        if verbose:
+            print(
+                f"[worker {worker_id} | gpu {gpu_id}] starting pid={os.getpid()} "
+                f"requested_device={requested_device} worker_device={regressor_kwargs.get('device')} "
+                f"diag={json.dumps(collect_torch_diagnostics(), ensure_ascii=False)}",
+                flush=True,
+            )
 
         from tabdpt import TabDPTRegressor
 
         regressor = TabDPTRegressor(**regressor_kwargs)
+
+        if verbose:
+            print(
+                f"[worker {worker_id} | gpu {gpu_id}] model initialized "
+                f"inf_batch_size={regressor.inf_batch_size} use_flash={regressor.use_flash} "
+                f"compile={regressor.compile}",
+                flush=True,
+            )
 
         rows: List[ResultRow] = []
         while True:
@@ -283,6 +303,8 @@ def worker_main(
                 break
 
             csv_path = Path(item)
+            if verbose:
+                print(f"[worker {worker_id} | gpu {gpu_id}] start {csv_path.name}", flush=True)
             row = evaluate_one_dataset(
                 regressor,
                 csv_path,
@@ -297,12 +319,14 @@ def worker_main(
                 if row.status == "ok":
                     print(
                         f"[worker {worker_id} | gpu {gpu_id}] "
-                        f"[ok] {row.dataset_name} r2={row.r2:.6f} rmse={row.rmse:.6f}"
+                        f"[ok] {row.dataset_name} r2={row.r2:.6f} rmse={row.rmse:.6f}",
+                        flush=True,
                     )
                 else:
                     print(
                         f"[worker {worker_id} | gpu {gpu_id}] "
-                        f"[fail] {row.dataset_name} error={row.error}"
+                        f"[fail] {row.dataset_name} error={row.error}",
+                        flush=True,
                     )
 
         pd.DataFrame(

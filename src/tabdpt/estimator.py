@@ -78,9 +78,10 @@ class TabDPTEstimator(BaseEstimator):
 
         """
         self.mode = mode
-        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        self.inf_batch_size = inf_batch_size if self.device == "cuda" else min(inf_batch_size, CPU_INF_BATCH)
-        self.use_flash = use_flash and self.device == "cuda"
+        self.device = str(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+        self._is_cuda_device = torch.device(self.device).type == "cuda"
+        self.inf_batch_size = inf_batch_size if self._is_cuda_device else min(inf_batch_size, CPU_INF_BATCH)
+        self.use_flash = use_flash and self._is_cuda_device
         self.missing_indicators = missing_indicators
 
         if model_weight_path:
@@ -100,7 +101,7 @@ class TabDPTEstimator(BaseEstimator):
 
         self.max_features = self.model.num_features
         self.max_num_classes = self.model.n_out
-        self.compile = compile and self.device == "cuda"
+        self.compile = compile and self._is_cuda_device
         self.feature_reduction = feature_reduction
         self.faiss_metric = faiss_metric
         self.faiss_knn = None
@@ -174,6 +175,7 @@ class TabDPTEstimator(BaseEstimator):
 
     def to(self, device: str):
         self.device = device
+        self._is_cuda_device = torch.device(self.device).type == "cuda"
         self.model.to(device)
 
         if self.V is not None:
