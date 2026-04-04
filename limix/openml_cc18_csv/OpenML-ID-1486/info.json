@@ -1,0 +1,19 @@
+{
+  "benchmark": "OpenML-CC18",
+  "suite_id": 99,
+  "openml_id": 1486,
+  "target_name": "Class",
+  "n_train": 27572,
+  "n_test": 6893,
+  "n_num_features": 89,
+  "n_cat_features": 29,
+  "y_classes": [
+    "1",
+    "2"
+  ],
+  "split": {
+    "random_seed": 42,
+    "test_size": 0.2,
+    "stratify": true
+  }
+}

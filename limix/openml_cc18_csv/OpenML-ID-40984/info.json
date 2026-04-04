@@ -1,0 +1,24 @@
+{
+  "benchmark": "OpenML-CC18",
+  "suite_id": 99,
+  "openml_id": 40984,
+  "target_name": "class",
+  "n_train": 1848,
+  "n_test": 462,
+  "n_num_features": 16,
+  "n_cat_features": 0,
+  "y_classes": [
+    "brickface",
+    "cement",
+    "foliage",
+    "grass",
+    "path",
+    "sky",
+    "window"
+  ],
+  "split": {
+    "random_seed": 42,
+    "test_size": 0.2,
+    "stratify": true
+  }
+}

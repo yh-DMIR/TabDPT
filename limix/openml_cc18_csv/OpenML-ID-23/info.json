@@ -1,0 +1,20 @@
+{
+  "benchmark": "OpenML-CC18",
+  "suite_id": 99,
+  "openml_id": 23,
+  "target_name": "Contraceptive_method_used",
+  "n_train": 1178,
+  "n_test": 295,
+  "n_num_features": 2,
+  "n_cat_features": 7,
+  "y_classes": [
+    "1",
+    "2",
+    "3"
+  ],
+  "split": {
+    "random_seed": 42,
+    "test_size": 0.2,
+    "stratify": true
+  }
+}

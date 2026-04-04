@@ -1,0 +1,24 @@
+{
+  "benchmark": "OpenML-CC18",
+  "suite_id": 99,
+  "openml_id": 40982,
+  "target_name": "target",
+  "n_train": 1552,
+  "n_test": 389,
+  "n_num_features": 27,
+  "n_cat_features": 0,
+  "y_classes": [
+    "Bumps",
+    "Dirtiness",
+    "K_Scratch",
+    "Other_Faults",
+    "Pastry",
+    "Stains",
+    "Z_Scratch"
+  ],
+  "split": {
+    "random_seed": 42,
+    "test_size": 0.2,
+    "stratify": true
+  }
+}

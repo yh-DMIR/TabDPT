@@ -1,0 +1,28 @@
+{
+  "benchmark": "OpenML-CC18",
+  "suite_id": 99,
+  "openml_id": 307,
+  "target_name": "Class",
+  "n_train": 792,
+  "n_test": 198,
+  "n_num_features": 10,
+  "n_cat_features": 2,
+  "y_classes": [
+    "hAd",
+    "hEd",
+    "hId",
+    "hOd",
+    "hUd",
+    "hYd",
+    "had",
+    "hed",
+    "hid",
+    "hod",
+    "hud"
+  ],
+  "split": {
+    "random_seed": 42,
+    "test_size": 0.2,
+    "stratify": true
+  }
+}

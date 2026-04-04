@@ -1,0 +1,19 @@
+{
+  "benchmark": "OpenML-CC18",
+  "suite_id": 99,
+  "openml_id": 1053,
+  "target_name": "defects",
+  "n_train": 8708,
+  "n_test": 2177,
+  "n_num_features": 21,
+  "n_cat_features": 0,
+  "y_classes": [
+    "False",
+    "True"
+  ],
+  "split": {
+    "random_seed": 42,
+    "test_size": 0.2,
+    "stratify": true
+  }
+}

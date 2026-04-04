@@ -1,0 +1,8 @@
+root: limix/tabzilla_csv
+discovered_pairs: 35
+processed_pairs: 8
+missing_test_count: 0
+missing_test_datasets: (none)
+failed_count: 8
+failed_datasets: __WORKER_CRASH__0, __WORKER_CRASH__1, __WORKER_CRASH__2, __WORKER_CRASH__3, __WORKER_CRASH__4, __WORKER_CRASH__5, __WORKER_CRASH__6, __WORKER_CRASH__7
+avg_accuracy_ok: (none)
