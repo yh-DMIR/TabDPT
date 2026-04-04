@@ -93,6 +93,21 @@ def collect_torch_diagnostics() -> Dict[str, object]:
     }
 
 
+def configure_worker_visible_devices(gpu_id: int, visible_device_env: str) -> None:
+    gpu_id_str = str(gpu_id)
+    # ROCm still uses torch.cuda.* APIs, but the visibility env var should be singular.
+    if visible_device_env == "hip":
+        os.environ["HIP_VISIBLE_DEVICES"] = gpu_id_str
+        os.environ.pop("ROCR_VISIBLE_DEVICES", None)
+    elif visible_device_env == "rocr":
+        os.environ["ROCR_VISIBLE_DEVICES"] = gpu_id_str
+        os.environ.pop("HIP_VISIBLE_DEVICES", None)
+    else:
+        raise ValueError(f"Unsupported visible_device_env: {visible_device_env}")
+
+    os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+
+
 def resolve_model_weight_path(model_path_arg: Optional[str]) -> str:
     if model_path_arg:
         model_path = Path(model_path_arg).expanduser()
@@ -254,13 +269,11 @@ def worker_main(
     test_size: float,
     random_state: int,
     target_standardize: bool,
+    visible_device_env: str,
     verbose: bool,
 ) -> None:
     try:
-        gpu_id_str = str(gpu_id)
-        os.environ["ROCR_VISIBLE_DEVICES"] = gpu_id_str
-        os.environ.pop("HIP_VISIBLE_DEVICES", None)
-        os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+        configure_worker_visible_devices(gpu_id, visible_device_env)
         os.environ.setdefault("OMP_NUM_THREADS", "1")
         os.environ.setdefault("MKL_NUM_THREADS", "1")
 
@@ -415,6 +428,12 @@ def main() -> None:
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--gpus", default="0,1,2,3,4,5,6,7")
     parser.add_argument("--device", default="cuda:0")
+    parser.add_argument(
+        "--visible-device-env",
+        default="hip",
+        choices=["hip", "rocr"],
+        help="Which ROCm visibility variable to use per worker. Default keeps prior HIP-based behavior.",
+    )
     parser.add_argument("--inf-batch-size", type=int, default=512)
     parser.add_argument("--normalizer", default="standard")
     parser.add_argument("--missing-indicators", action="store_true")
@@ -505,6 +524,7 @@ def main() -> None:
                 args.test_size,
                 args.random_state,
                 target_standardize,
+                args.visible_device_env,
                 args.verbose,
             ),
             daemon=False,
@@ -523,6 +543,12 @@ def main() -> None:
                 if not proc.is_alive() and idx not in ready_workers
             ]
             if dead_workers:
+                start_event.set()
+                for proc in processes:
+                    if proc.is_alive():
+                        proc.terminate()
+                for proc in processes:
+                    proc.join(timeout=5)
                 raise RuntimeError(
                     "Some workers exited before initialization completed: "
                     + ", ".join(dead_workers)
@@ -539,6 +565,12 @@ def main() -> None:
             continue
 
         if message.get("status") == "crash":
+            start_event.set()
+            for proc in processes:
+                if proc.is_alive():
+                    proc.terminate()
+            for proc in processes:
+                proc.join(timeout=5)
             raise RuntimeError(
                 f"Worker {message['worker_id']} on gpu {message['gpu_id']} crashed "
                 f"during initialization:\n{message.get('error', '(no traceback)')}"
@@ -573,6 +605,7 @@ def main() -> None:
     print("predict_kwargs:")
     print(json.dumps(predict_kwargs, indent=2, ensure_ascii=False))
     print(f"target_standardize: {target_standardize}")
+    print(f"visible_device_env: {args.visible_device_env}")
 
 
 if __name__ == "__main__":
